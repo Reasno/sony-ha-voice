@@ -55,6 +55,12 @@ final class ConfigStore {
         return preferences.getBoolean("autostart", true);
     }
 
+    boolean screenshotEnabled() { return preferences.getBoolean("send_screenshot", false); }
+
+    void screenshotEnabled(boolean enabled) {
+        preferences.edit().putBoolean("send_screenshot", enabled).apply();
+    }
+
     static JSONObject defaults() {
         JSONObject config = new JSONObject();
         try {

@@ -3,11 +3,13 @@ package dev.guxi.sonyhavoice;
 import android.content.Context;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.Base64;
 import java.io.ByteArrayOutputStream;
 import java.util.concurrent.TimeUnit;
 import okhttp3.*;
 import okio.ByteString;
 import org.json.JSONObject;
+import org.json.JSONArray;
 
 final class AssistClient {
     interface Listener {
@@ -27,6 +29,8 @@ final class AssistClient {
     private int nextId = 1, runId, handlerId = -1, attempt, generation;
     private int turnGeneration;
     private String conversationId;
+    private byte[] image;
+    private String imageText, imageAgent, imageLanguage, imagePipeline, step = "";
     private long conversationUpdatedAt;
     private static final long CONVERSATION_IDLE_MS = 10 * 60 * 1000L;
     private final ByteArrayOutputStream pending = new ByteArrayOutputStream();
@@ -138,10 +142,45 @@ final class AssistClient {
                 store.save(config);
                 connect();
             } else status("授权失败，请重新配置");
-        } else if ("result".equals(type) && message.optInt("id") == runId
-            && !message.optBoolean("success")) {
-            JSONObject error = message.optJSONObject("error");
-            failRun("HA 拒绝会话：" + (error == null ? "unknown" : error.optString("code")));
+        } else if ("result".equals(type) && runId != 0 && message.optInt("id") == runId) {
+            if (!message.optBoolean("success")) {
+                JSONObject error = message.optJSONObject("error");
+                String code = error == null ? "unknown" : error.optString("code");
+                failRun("unknown_command".equals(code)
+                    ? "HA 尚未安装对话附图入口"
+                    : "HA 拒绝会话：" + code);
+                return;
+            }
+            if ("pipeline-list".equals(step)) {
+                JSONObject result = message.getJSONObject("result");
+                String wanted = config.optString("pipeline");
+                if (wanted.isEmpty()) wanted = result.getString("preferred_pipeline");
+                JSONArray pipelines = result.getJSONArray("pipelines");
+                JSONObject selected = null;
+                for (int i = 0; i < pipelines.length(); i++)
+                    if (wanted.equals(pipelines.getJSONObject(i).optString("id")))
+                        selected = pipelines.getJSONObject(i);
+                if (selected == null) { failRun("找不到配置的 HA 语音流程"); return; }
+                imageAgent = selected.optString("conversation_engine");
+                imageLanguage = selected.optString("language");
+                imagePipeline = wanted;
+                if (audioStage) beginPipeline(null, "stt");
+                else beginImageConversation();
+            } else if ("image-conversation".equals(step)) {
+                JSONObject output = message.getJSONObject("result");
+                JSONObject response = output.optJSONObject("response");
+                if (response == null || "error".equals(response.optString("response_type"))) {
+                    failRun("附图对话失败，请检查 HA 对话模型是否支持图片"); return;
+                }
+                rememberConversation(output);
+                emit("intent-end", json("intent_output", output));
+                JSONObject speech = response.optJSONObject("speech");
+                JSONObject plain = speech == null ? null : speech.optJSONObject("plain");
+                String spoken = plain == null ? "" : plain.optString("speech");
+                if (spoken.isEmpty()) {
+                    resetRun(); emit("run-end", new JSONObject());
+                } else beginPipeline(spoken, "tts");
+            }
         } else if ("event".equals(type) && runId != 0 && message.optInt("id") == runId) {
             JSONObject event = message.getJSONObject("event");
             String eventType = event.getString("type");
@@ -156,13 +195,13 @@ final class AssistClient {
                 audioStage = false;
                 sttReady = false;
                 pending.reset();
+                if ("stt".equals(step)) {
+                    JSONObject output = data.optJSONObject("stt_output");
+                    imageText = output == null ? "" : output.optString("text");
+                }
             } else if ("intent-end".equals(eventType)) {
                 JSONObject output = data.optJSONObject("intent_output");
-                String id = output == null ? "" : output.optString("conversation_id", "");
-                if (!id.isEmpty() && !"null".equals(id)) {
-                    conversationId = id;
-                    conversationUpdatedAt = android.os.SystemClock.elapsedRealtime();
-                }
+                rememberConversation(output);
             } else if ("error".equals(eventType)) {
                 String code = data.optString("code", "unknown");
                 android.util.Log.i("SonyHAVoice", "pipeline_error=" + code);
@@ -171,39 +210,77 @@ final class AssistClient {
                     : "HA 会话失败：" + code);
                 return;
             } else if ("run-end".equals(eventType)) {
+                if ("stt".equals(step)) { beginImageConversation(); return; }
                 resetRun();
             }
             emit(eventType, data);
         }
     }
-    synchronized void start(String text) throws Exception {
+    private void rememberConversation(JSONObject output) {
+        String id = output == null ? "" : output.optString("conversation_id", "");
+        if (!id.isEmpty() && !"null".equals(id)) {
+            conversationId = id;
+            conversationUpdatedAt = android.os.SystemClock.elapsedRealtime();
+        }
+    }
+    synchronized void start(String text) throws Exception { start(text, null); }
+    synchronized void start(String text, byte[] screenshot) throws Exception {
         if (!ready || runId != 0) throw new IllegalStateException("HA 尚未就绪或会话正在进行");
         turnGeneration++;
-        runId = nextId++;
         handlerId = -1;
         finishing = false;
         sttReady = false;
         pending.reset();
         audioStage = text == null;
+        image = screenshot; imageText = text;
+        if (conversationId != null
+            && android.os.SystemClock.elapsedRealtime() - conversationUpdatedAt >= CONVERSATION_IDLE_MS)
+            conversationId = null;
+        main.postDelayed(deadline, screenshot == null ? 95000 : 140000);
+        if (screenshot != null) {
+            step = "pipeline-list"; runId = nextId++;
+            send(new JSONObject().put("id", runId).put("type", "assist_pipeline/pipeline/list"));
+        } else beginPipeline(text, text == null ? "stt" : "intent");
+    }
+    private void beginPipeline(String text, String startStage) throws Exception {
+        runId = nextId++;
+        handlerId = -1; sttReady = false;
+        boolean sttOnly = image != null && "stt".equals(startStage);
+        step = sttOnly ? "stt" : "pipeline";
         JSONObject input = new JSONObject();
-        input.put(text == null ? "sample_rate" : "text", text == null ? 16000 : text);
-        if (text == null) {
+        input.put("stt".equals(startStage) ? "sample_rate" : "text",
+            "stt".equals(startStage) ? 16000 : text);
+        if ("stt".equals(startStage)) {
             input.put("no_vad", true);
             input.put("volume_multiplier", 4);
         }
         JSONObject command = new JSONObject().put("id", runId).put("type", "assist_pipeline/run")
-            .put("start_stage", text == null ? "stt" : "intent").put("end_stage", "tts")
+            .put("start_stage", startStage).put("end_stage", sttOnly ? "stt" : "tts")
             .put("input", input).put("timeout", 90);
-        if (!config.optString("pipeline").isEmpty()) command.put("pipeline", config.optString("pipeline"));
+        String pipeline = imagePipeline == null ? config.optString("pipeline") : imagePipeline;
+        if (!pipeline.isEmpty()) command.put("pipeline", pipeline);
         if (!config.optString("device_id").isEmpty()) command.put("device_id", config.optString("device_id"));
-        if (conversationId != null
-            && android.os.SystemClock.elapsedRealtime() - conversationUpdatedAt < CONVERSATION_IDLE_MS) {
+        if (conversationId != null) {
             command.put("conversation_id", conversationId);
-        } else conversationId = null;
+        }
         android.util.Log.i("SonyHAVoice", "turn_start id=" + runId
             + " context=" + (conversationId != null));
         send(command);
-        main.postDelayed(deadline, 95000);
+    }
+    private void beginImageConversation() throws Exception {
+        if (imageText == null || imageText.trim().isEmpty()) {
+            failRun("未识别到语音，请重新说"); return;
+        }
+        step = "image-conversation"; runId = nextId++;
+        JSONObject command = new JSONObject().put("id", runId)
+            .put("type", "local_openai/conversation/process").put("agent_id", imageAgent)
+            .put("text", imageText).put("image", Base64.encodeToString(image, Base64.NO_WRAP));
+        image = null;
+        if (conversationId != null) command.put("conversation_id", conversationId);
+        if (!imageLanguage.isEmpty()) command.put("language", imageLanguage);
+        if (!config.optString("device_id").isEmpty()) command.put("device_id", config.optString("device_id"));
+        emit("image-start", new JSONObject());
+        send(command);
     }
     synchronized void audio(byte[] pcm) {
         if (runId == 0 || finishing || !audioStage) return;
@@ -247,6 +324,7 @@ final class AssistClient {
     }
     private void resetRun() {
         runId = 0; handlerId = -1; finishing = false; sttReady = false; audioStage = false;
+        image = null; imageText = null; imageAgent = null; imageLanguage = null; imagePipeline = null; step = "";
         pending.reset(); main.removeCallbacks(deadline);
     }
     private synchronized void reconnect(String message) {

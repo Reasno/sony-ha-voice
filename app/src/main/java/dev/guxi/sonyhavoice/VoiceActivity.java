@@ -4,6 +4,7 @@ import android.Manifest;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.graphics.Bitmap;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.StateListDrawable;
@@ -20,6 +21,11 @@ public final class VoiceActivity extends ConnectedActivity {
     private TextView phase, transcript, answer, meter;
     private EditText textInput;
     private Button action;
+    private Switch screenshotToggle;
+    private ImageView screenshotPreview;
+    private Bitmap screenshotBitmap;
+    private byte[] screenshotJpeg;
+    private boolean capturing;
     private VoiceOrb orb;
     private ScrollView speechView;
     private PcmRecorder recorder;
@@ -49,6 +55,14 @@ public final class VoiceActivity extends ConnectedActivity {
         action.setText(textMode ? "发送文字" : "开始语音");
         action.setOnClickListener(v -> {
             if (listening) stopRecording();
+            else requestTurn();
+        });
+        screenshotToggle.setChecked(new ConfigStore(this).screenshotEnabled());
+        screenshotToggle.setOnCheckedChangeListener((button, enabled) -> {
+            new ConfigStore(this).screenshotEnabled(enabled);
+            if (textMode) {
+                cancelSession(); phase.setText(enabled ? "按发送开始附图对话" : "按发送开始对话");
+            }
             else requestTurn();
         });
         action.requestFocus();
@@ -96,6 +110,12 @@ public final class VoiceActivity extends ConnectedActivity {
         orb = new VoiceOrb(this);
         LinearLayout.LayoutParams orbSize = new LinearLayout.LayoutParams(dp(100), dp(100));
         orbSize.rightMargin = dp(22); panel.addView(orb, orbSize);
+        screenshotPreview = new ImageView(this);
+        screenshotPreview.setContentDescription("本轮电视截图");
+        screenshotPreview.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        screenshotPreview.setVisibility(View.GONE);
+        LinearLayout.LayoutParams previewSize = new LinearLayout.LayoutParams(dp(128), dp(80));
+        previewSize.rightMargin = dp(18); panel.addView(screenshotPreview, previewSize);
         layout = new LinearLayout(this); layout.setOrientation(LinearLayout.VERTICAL);
         panel.addView(layout, new LinearLayout.LayoutParams(0, -2, 1));
         TextView brand = label("Home Assistant", 12, 0xFFA9BBD9);
@@ -117,8 +137,17 @@ public final class VoiceActivity extends ConnectedActivity {
         LinearLayout footer = new LinearLayout(this); footer.setGravity(Gravity.CENTER_VERTICAL);
         meter = label("按语音键开始 · 返回关闭", 12, 0xFF9FAFCB);
         footer.addView(meter, new LinearLayout.LayoutParams(0, -2, 1));
+        screenshotToggle = new Switch(this);
+        screenshotToggle.setText("附电视截图"); screenshotToggle.setTextColor(Color.WHITE);
+        screenshotToggle.setTextSize(13); screenshotToggle.setShowText(false);
+        screenshotToggle.setSwitchPadding(dp(8)); screenshotToggle.setPadding(dp(8), 0, dp(8), 0);
+        screenshotToggle.setBackground(surface(0x18FFFFFF, 18));
+        screenshotToggle.setOnFocusChangeListener((view, focused) ->
+            view.setBackground(surface(focused ? 0x555E86C2 : 0x18FFFFFF, 18)));
+        footer.addView(screenshotToggle, new LinearLayout.LayoutParams(-2, dp(40)));
         action = pill("开始语音");
-        footer.addView(action, new LinearLayout.LayoutParams(-2, dp(40)));
+        LinearLayout.LayoutParams actionSize = new LinearLayout.LayoutParams(-2, dp(40));
+        actionSize.leftMargin = dp(12); footer.addView(action, actionSize);
         Button close = pill("关闭"); close.setOnClickListener(v -> finish());
         LinearLayout.LayoutParams closeSize = new LinearLayout.LayoutParams(-2, dp(40));
         closeSize.leftMargin = dp(12); footer.addView(close, closeSize);
@@ -175,8 +204,42 @@ public final class VoiceActivity extends ConnectedActivity {
     }
     private void startPendingTurn() {
         if (!visible || !resumed || !autoStart || service == null || !service.client().ready()) return;
+        if (capturing) return;
+        if (screenshotToggle.isChecked() && screenshotJpeg == null) {
+            captureScreenshot(); return;
+        }
         if (textMode || checkSelfPermission(Manifest.permission.RECORD_AUDIO)
             == PackageManager.PERMISSION_GRANTED) startSession();
+    }
+    private void captureScreenshot() {
+        capturing = true;
+        android.util.Log.i("SonyHAVoice", "overlay_hidden_for_capture");
+        main.removeCallbacks(waitTimeout);
+        phase.setText("正在截取电视画面");
+        int current = sessionGeneration;
+        View decor = getWindow().getDecorView();
+        decor.setAlpha(0);
+        // Allow the translucent window to render without the assistant panel before capture.
+        main.postDelayed(() -> {
+            if (!visible || !capturing || current != sessionGeneration) return;
+            ScreenshotCapture.request(this, (preview, jpeg, error) -> {
+                if (!visible || current != sessionGeneration) {
+                    if (preview != null) preview.recycle();
+                    return;
+                }
+                capturing = false; decor.setAlpha(1);
+                android.util.Log.i("SonyHAVoice", "overlay_restored_after_capture success=" + (error == null));
+                if (error != null) {
+                    if (preview != null) preview.recycle();
+                    autoStart = false; phase.setText(error); action.setText("重试");
+                    return;
+                }
+                screenshotBitmap = preview; screenshotJpeg = jpeg;
+                screenshotPreview.setImageBitmap(preview);
+                screenshotPreview.setVisibility(View.VISIBLE);
+                main.post(this::startPendingTurn);
+            });
+        }, 200);
     }
     private void startSession() {
         if (service == null || !service.client().ready()) { phase.setText("HA 尚未就绪"); return; }
@@ -195,7 +258,7 @@ public final class VoiceActivity extends ConnectedActivity {
         int current = ++sessionGeneration;
         try {
             requestFocus();
-            service.client().start(textMode ? textInput.getText().toString() : null);
+            service.client().start(textMode ? textInput.getText().toString() : null, screenshotJpeg);
             inSession = true; played = false; processing = false;
             action.setText(textMode ? "重新发送" : "结束录音");
             if (textMode) { phase.setText("正在处理"); return; }
@@ -252,6 +315,8 @@ public final class VoiceActivity extends ConnectedActivity {
             }
             phase.setText("正在准备回答");
             action.setText(textMode ? "发送文字" : "重新说");
+        } else if ("image-start".equals(type)) {
+            phase.setText("正在结合画面思考");
         } else if ("tts-end".equals(type)) {
             JSONObject output = data.optJSONObject("tts_output");
             if (output != null && !output.optString("url").isEmpty()) play(output.optString("url"));
@@ -361,6 +426,13 @@ public final class VoiceActivity extends ConnectedActivity {
     }
     private void cancelSession() {
         sessionGeneration++; autoStart = false; inSession = false; listening = false;
+        capturing = false; ScreenshotCapture.cancel();
+        if (getWindow() != null) getWindow().getDecorView().setAlpha(1);
+        if (screenshotPreview != null) {
+            screenshotPreview.setImageDrawable(null); screenshotPreview.setVisibility(View.GONE);
+        }
+        if (screenshotBitmap != null) screenshotBitmap.recycle();
+        screenshotBitmap = null; screenshotJpeg = null;
         if (recorder != null) { recorder.stop(); recorder = null; }
         if (service != null) service.client().cancel();
         releasePlayer(); abandonFocus();
