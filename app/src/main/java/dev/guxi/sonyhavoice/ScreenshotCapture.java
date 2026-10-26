@@ -56,7 +56,7 @@ final class ScreenshotCapture {
             + " waiting=" + waiting(id) + " available=" + (bitmap != null));
         if (!waiting(id)) { if (bitmap != null) bitmap.recycle(); return; }
         if (bitmap == null) {
-            deliver(id, null, null, "当前画面无法截取，受保护的视频内容可能不允许截图");
+            deliver(id, null, null, "系统未返回当前画面，请重试或检查助手截图权限");
             return;
         }
         // Avoid retaining a full-resolution TV framebuffer or compressing it on the UI thread.

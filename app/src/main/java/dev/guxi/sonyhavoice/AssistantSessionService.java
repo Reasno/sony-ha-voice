@@ -33,7 +33,11 @@ public final class AssistantSessionService extends VoiceInteractionSessionServic
                 }
                 Log.i("SonyHAVoice", "assistant_session_shown");
                 try {
-                    startAssistantActivity(new Intent(AssistantSessionService.this, VoiceActivity.class)
+                    // A normal task can request a fresh assist screenshot on subsequent turns.
+                    // Android rejects assist data while an assistant task has focus.
+                    AssistantSessionService.this.startActivity(
+                        new Intent(AssistantSessionService.this, VoiceActivity.class)
+                        .setAction(Intent.ACTION_ASSIST)
                         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
                 } catch (Exception error) {
                     Log.e("SonyHAVoice", "assistant_activity_start_failed");
